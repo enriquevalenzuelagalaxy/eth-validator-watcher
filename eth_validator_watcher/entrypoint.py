@@ -24,9 +24,8 @@ from .queues import (
     get_pending_consolidations,
     get_pending_withdrawals,
 )
-from .utils import LABEL_SCOPE_ALL_NETWORK
-from .utils import LABEL_SCOPE_ALL_NETWORK
 from .utils import (
+    LABEL_SCOPE_ALL_NETWORK,
     SLOT_FOR_CONFIG_RELOAD,
     SLOT_FOR_MISSED_ATTESTATIONS_PROCESS,
     SLOT_FOR_REWARDS_PROCESS,
@@ -403,11 +402,6 @@ def handler(
         level=logging.INFO,
         format='%(asctime)s %(levelname)-8s %(message)s'
     )
-
-    # Suppress verbose logging from HTTP libraries
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
-    logging.getLogger('requests').setLevel(logging.WARNING)
-    logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
 
     watcher = ValidatorWatcher(config)
     watcher.run()
