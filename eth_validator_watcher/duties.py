@@ -122,6 +122,9 @@ def process_duties(watched_validators: WatchedValidators, previous_slot_committe
     # Update validators
     for validator, ok in validator_duty_performed.items():
         v = watched_validators.get_validator_by_index(validator)
+        # Skip if this validator is not in our watched set
+        if v is None:
+            continue
         # Here we keep both the current slot and the corresponding value,
         # this is to avoid iterating over the entire validator set: in
         # the compute metrics code we check the slot_id with the

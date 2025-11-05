@@ -237,6 +237,7 @@ class WatchedValidators:
     def __init__(self):
         self._validators: dict[int, WatchedValidator] = {}
         self._pubkey_to_index: dict[str, int] = {}
+        self._watched_pubkeys: set[str] = set()  # Set of watched public keys for fast lookup
 
         self.config_initialized = False
 
@@ -293,6 +294,10 @@ class WatchedValidators:
         Returns:
             None
         """
+        # Build set of watched public keys for fast lookup
+        for item in config.watched_keys:
+            self._watched_pubkeys.add(normalized_public_key(item.public_key))
+
         for item in config.watched_keys:
             index = self._pubkey_to_index.get(normalized_public_key(item.public_key), None)
             if index:
@@ -313,11 +318,20 @@ class WatchedValidators:
             None
         """
         for item in validators.data:
+            # Normalize the public key for lookup
+            normalized_pubkey = normalized_public_key(item.validator.pubkey)
+
+            # Only process validators that are in our watched list
+            # If config not initialized yet, we'll process all (backwards compatibility)
+            # Once config is loaded, we filter to only watched keys
+            if self.config_initialized and normalized_pubkey not in self._watched_pubkeys:
+                continue
+
             validator = self._validators.get(item.index)
             if validator is None:
                 validator = WatchedValidator()
                 self._validators[item.index] = validator
-                self._pubkey_to_index[normalized_public_key(item.validator.pubkey)] = item.index
+                self._pubkey_to_index[normalized_pubkey] = item.index
 
             validator.process_epoch(item)
 
@@ -337,3 +351,51 @@ class WatchedValidators:
             validator = self._validators.get(item.index)
             if validator:
                 validator.process_liveness(item, current_epoch)
+
+    def compute_network_aggregates(self, validators: Validators) -> dict:
+        """Compute lightweight aggregate metrics for all network validators.
+
+        This processes the raw validator data to compute network-wide statistics
+        WITHOUT creating full WatchedValidator objects, keeping memory usage low.
+
+        Args:
+            validators: Validators
+                Raw validator data from the beacon chain.
+
+        Returns:
+            dict: Aggregate metrics including:
+                - validator_counts: dict of status -> count
+                - total_effective_balance: total stake in gwei
+                - slashed_count: number of slashed validators
+        """
+        from .models import Validators as ValidatorsModel
+
+        # Initialize counters
+        status_counts = {}
+        total_effective_balance = 0
+        slashed_count = 0
+        type_counts = {}  # For 0x01 vs 0x02 withdrawal credentials
+
+        for item in validators.data:
+            # Count by status
+            status = item.status.value
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+            # Sum effective balance
+            total_effective_balance += item.validator.effective_balance
+
+            # Count slashed
+            if item.validator.slashed:
+                slashed_count += 1
+
+            # Count by withdrawal credential type (0x01 = BLS, 0x02 = execution address)
+            withdrawal_type = item.validator.withdrawal_credentials[:4]  # First 2 bytes (0x01 or 0x02)
+            type_counts[withdrawal_type] = type_counts.get(withdrawal_type, 0) + 1
+
+        return {
+            'status_counts': status_counts,
+            'total_effective_balance': total_effective_balance,
+            'slashed_count': slashed_count,
+            'type_counts': type_counts,
+            'total_count': len(validators.data)
+        }

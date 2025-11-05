@@ -24,6 +24,8 @@ from .queues import (
     get_pending_consolidations,
     get_pending_withdrawals,
 )
+from .utils import LABEL_SCOPE_ALL_NETWORK
+from .utils import LABEL_SCOPE_ALL_NETWORK
 from .utils import (
     SLOT_FOR_CONFIG_RELOAD,
     SLOT_FOR_MISSED_ATTESTATIONS_PROCESS,
@@ -114,6 +116,7 @@ class ValidatorWatcher:
             pending_deposits: tuple[int, int],
             pending_consolidations: int,
             pending_withdrawals: int,
+            network_aggregates: dict | None = None,
     ) -> None:
         """Update the Prometheus metrics with the watched validators data.
 
@@ -130,6 +133,8 @@ class ValidatorWatcher:
                 Number of pending consolidations.
             pending_withdrawals: int
                 Number of pending withdrawals.
+            network_aggregates: dict | None
+                Optional lightweight aggregate stats for all network validators.
 
         Returns:
             None
@@ -200,6 +205,37 @@ class ValidatorWatcher:
 
             self._metrics.eth_future_block_proposals.labels(label, network).set(m.future_blocks_proposal)
 
+        # Populate lightweight all-network aggregate metrics if available
+        if network_aggregates:
+            all_network_label = LABEL_SCOPE_ALL_NETWORK
+
+            # Validator status counts from aggregates
+            for status_str, count in network_aggregates['status_counts'].items():
+                # Convert status string to enum (e.g., "active_ongoing" -> StatusEnum.activeOngoing)
+                try:
+                    status_enum = Validators.DataItem.StatusEnum(status_str)
+                    self._metrics.eth_validator_status_count.labels(all_network_label, status_enum, network).set(count)
+
+                    # For scaled count, we assume 32 ETH validators (can be refined later)
+                    # This is a simplification since we don't have individual EB data in aggregates
+                    scaled_count = count  # 1:1 mapping assuming 32 ETH validators
+                    self._metrics.eth_validator_status_scaled_count.labels(all_network_label, status_enum, network).set(scaled_count)
+                except ValueError:
+                    logging.warning(f'Unknown validator status in aggregates: {status_str}')
+
+            # Validator type counts (0x01 vs 0x02 withdrawal credentials)
+            for withdrawal_type_str, count in network_aggregates['type_counts'].items():
+                # Extract type number from "0x01" or "0x02"
+                if withdrawal_type_str.startswith('0x'):
+                    type_num = int(withdrawal_type_str[2:4], 16)  # Convert hex to int
+                    self._metrics.eth_validator_type_count.labels(all_network_label, type_num, network).set(count)
+                    self._metrics.eth_validator_type_scaled_count.labels(all_network_label, type_num, network).set(count)
+
+            # Slashed validators count
+            self._metrics.eth_slashed_validators_count.labels(all_network_label, network).set(network_aggregates['slashed_count'])
+
+            logging.info(f'📊 Updated all-network metrics: {network_aggregates["total_count"]} validators')
+
         global prometheus_metrics_thread_started
         if not prometheus_metrics_thread_started:
             start_http_server(self._cfg.metrics_port)
@@ -225,6 +261,7 @@ class ValidatorWatcher:
         pending_deposits = None
         pending_consolidations = None
         pending_withdrawals = None
+        network_aggregates = None  # Lightweight network-wide stats
 
         slack_send(self._cfg, f'🚀 *Ethereum Validator Watcher* started on {self._cfg.network}, watching {len(self._cfg.watched_keys)} validators')
 
@@ -235,19 +272,35 @@ class ValidatorWatcher:
             self._schedule.update(self._beacon, slot)
 
             if beacon_validators is None or (slot % self._spec.data.SLOTS_PER_EPOCH == 0):
-                logging.info(f'Processing epoch {epoch}')
-                # Extract public keys from watched_keys config
-                watched_pubkeys = [key.public_key for key in self._cfg.watched_keys] if self._cfg.watched_keys else []
-                if watched_pubkeys:
-                    logging.info(f'Fetching {len(watched_pubkeys)} watched validators (memory-optimized)')
+                logging.info(f'🔨 Processing epoch {epoch}')
+
+                # Get lightweight network aggregates (counts by status)
+                logging.info('📊 Fetching network-wide validator counts')
+                status_counts = self._beacon.get_validator_count_by_status(self._clock.epoch_to_slot(epoch))
+                network_aggregates = {
+                    'status_counts': status_counts,
+                    'total_count': sum(status_counts.values()),
+                    'slashed_count': 0,  # TODO: Add separate query if needed
+                    'type_counts': {},  # TODO: Add if we need withdrawal credential type breakdown
+                    'total_effective_balance': 0  # Not available from count queries
+                }
+                logging.info(f'📊 Network: {network_aggregates["total_count"]} total validators')
+
+                # Get ONLY watched validators (filtered API call)
+                if self._cfg.watched_keys:
+                    watched_pubkeys = [key.public_key for key in self._cfg.watched_keys]
+                    logging.info(f'📊 Fetching {len(watched_pubkeys)} watched validators')
+                    beacon_validators = self._beacon.get_validators_by_pubkeys(
+                        self._clock.epoch_to_slot(epoch),
+                        watched_pubkeys
+                    )
+                    logging.info(f'📊 Retrieved {len(beacon_validators.data)} watched validators')
                 else:
-                    logging.warning('WARNING: No watched_keys configured - fetching ALL validators (high memory usage!)')
-                # Only fetch watched validators to save memory (not all 1M+ validators!)
-                beacon_validators = self._beacon.get_validators(
-                    self._clock.epoch_to_slot(epoch),
-                    validator_ids=watched_pubkeys if watched_pubkeys else None
-                )
-                logging.info(f'Received {len(beacon_validators.data)} validators from beacon API')
+                    # Fallback: if no watched keys configured, fetch all (original behavior)
+                    logging.warning('⚠️ No watched keys configured, fetching all validators')
+                    beacon_validators = self._beacon.get_validators(self._clock.epoch_to_slot(epoch))
+
+                # Process detailed state only for watched validators
                 watched_validators.process_epoch(beacon_validators)
                 if not watched_validators.config_initialized:
                     watched_validators.process_config(self._cfg)
@@ -305,7 +358,7 @@ class ValidatorWatcher:
                 process_duties(watched_validators, previous_slot_committees, current_attestations, slot)
 
             logging.info('🔨 Updating Prometheus metrics')
-            self._update_metrics(watched_validators, epoch, slot, pending_deposits, pending_consolidations, pending_withdrawals)
+            self._update_metrics(watched_validators, epoch, slot, pending_deposits, pending_consolidations, pending_withdrawals, network_aggregates)
 
             if (slot % self._spec.data.SLOTS_PER_EPOCH == SLOT_FOR_CONFIG_RELOAD):
                 logging.info('🔨 Processing configuration update')
@@ -350,6 +403,11 @@ def handler(
         level=logging.INFO,
         format='%(asctime)s %(levelname)-8s %(message)s'
     )
+
+    # Suppress verbose logging from HTTP libraries
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('requests').setLevel(logging.WARNING)
+    logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
 
     watcher = ValidatorWatcher(config)
     watcher.run()

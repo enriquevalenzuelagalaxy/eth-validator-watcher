@@ -293,38 +293,91 @@ class Beacon:
 
         return ProposerDuties.model_validate_json(response.text)
 
-    def get_validators(self, slot: int, validator_ids: list[str] = None) -> Validators:
+    def get_validators(self, slot: int) -> Validators:
         """Get validator information for a specific slot.
 
         Args:
             slot: int
                 Slot for which to retrieve validator information.
-            validator_ids: list[str], optional
-                List of validator public keys or indices to filter by.
-                If None, returns all validators (WARNING: uses lots of memory!).
-                If provided, only returns the specified validators.
 
         Returns:
             Validators
                 The validator information for the specified slot.
         """
-        url = f"{self._url}/eth/v1/beacon/states/{slot}/validators"
-
-        # If validator_ids provided, use POST to avoid URL length limits
-        # (80k validators would create ~8MB URL which exceeds HTTP limits)
-        if validator_ids is not None and len(validator_ids) > 0:
-            response = self._post_retry_not_found(
-                url,
-                json=validator_ids,
-                timeout=self._timeout_sec
-            )
-        else:
-            # No filter - get all validators (memory-intensive!)
-            response = self._get_retry_not_found(url, timeout=self._timeout_sec)
+        response = self._get_retry_not_found(
+            f"{self._url}/eth/v1/beacon/states/{slot}/validators", timeout=self._timeout_sec
+        )
 
         response.raise_for_status()
 
         return Validators.model_validate_json(response.text)
+
+    def get_validators_by_pubkeys(self, slot: int, pubkeys: list[str]) -> Validators:
+        """Get validator information for specific public keys at a slot.
+
+        Args:
+            slot: int
+                Slot for which to retrieve validator information.
+            pubkeys: list[str]
+                List of validator public keys to fetch.
+
+        Returns:
+            Validators
+                The validator information for the specified validators.
+        """
+        # Use POST request for large lists of pubkeys to avoid URL length limits
+        # Beacon API spec: POST /eth/v1/beacon/states/{state_id}/validators
+        # with body: {"ids": ["pubkey1", "pubkey2", ...]}
+
+        response = self._post_retry_not_found(
+            f"{self._url}/eth/v1/beacon/states/{slot}/validators",
+            json={"ids": pubkeys},
+            timeout=self._timeout_sec * 3  # Longer timeout for large requests
+        )
+
+        response.raise_for_status()
+
+        return Validators.model_validate_json(response.text)
+
+    def get_validator_count_by_status(self, slot: int) -> dict:
+        """Get lightweight validator counts by status without fetching full data.
+
+        This uses status filters to get counts for each validator state,
+        avoiding the memory overhead of fetching 2M+ validator objects.
+
+        Args:
+            slot: int
+                Slot for which to retrieve validator counts.
+
+        Returns:
+            dict: Validator counts by status, e.g.:
+                {
+                    'pending_initialized': 100,
+                    'pending_queued': 500,
+                    'active_ongoing': 950000,
+                    ...
+                }
+        """
+        from .models import Validators
+
+        status_counts = {}
+
+        # Query each status separately to get counts
+        # This is more efficient than fetching all 2.1M validators
+        for status in Validators.DataItem.StatusEnum:
+            response = self._get_retry_not_found(
+                f"{self._url}/eth/v1/beacon/states/{slot}/validators?status={status.value}",
+                timeout=self._timeout_sec * 2
+            )
+
+            if response.status_code == 200:
+                # Parse just to count, then discard
+                validators = Validators.model_validate_json(response.text)
+                status_counts[status.value] = len(validators.data)
+            else:
+                status_counts[status.value] = 0
+
+        return status_counts
 
     def get_rewards(self, epoch: int) -> Rewards:
         """Get attestation rewards for a specific epoch.
